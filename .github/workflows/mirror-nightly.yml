@@ -97,7 +97,7 @@ jobs:
       - name: Install AppImage build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes imagemagick
+          sudo apt-get install --no-install-recommends --yes imagemagick ripgrep
 
       - name: Build AppImage and updater metadata
         working-directory: source
