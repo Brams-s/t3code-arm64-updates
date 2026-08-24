@@ -2,6 +2,12 @@ name: Mirror T3 Code ARM64 nightly
 
 on:
   workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: Rebuild and replace the newest mirrored release
+        required: false
+        default: false
+        type: boolean
   schedule:
     - cron: "45 */3 * * *"
 
@@ -25,6 +31,7 @@ jobs:
         name: Resolve release
         env:
           FEED_REPOSITORY: ${{ github.repository }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -42,8 +49,13 @@ jobs:
 
           version="${tag#v}"
           if gh release view "$tag" --repo "$FEED_REPOSITORY" >/dev/null 2>&1; then
-            build_required=false
-            echo "Release $tag is already mirrored."
+            if [[ "$FORCE_REBUILD" == "true" ]]; then
+              build_required=true
+              echo "Release $tag will be rebuilt and replaced."
+            else
+              build_required=false
+              echo "Release $tag is already mirrored."
+            fi
           else
             build_required=true
             echo "Release $tag needs an ARM64 build."
@@ -66,6 +78,9 @@ jobs:
     outputs:
       upstream_sha: ${{ steps.source.outputs.sha }}
     steps:
+      - name: Check out feed repository
+        uses: actions/checkout@v6
+
       - name: Check out exact upstream tag
         uses: actions/checkout@v6
         with:
@@ -78,6 +93,10 @@ jobs:
         name: Record upstream commit
         working-directory: source
         run: echo "sha=$(git rev-parse HEAD)" >>"$GITHUB_OUTPUT"
+
+      - name: Select the rootless static AppImage runtime
+        working-directory: source
+        run: git apply ../patches/static-appimage-runtime.patch
 
       - name: Set up Vite+
         uses: voidzero-dev/setup-vp@v1
@@ -126,6 +145,8 @@ jobs:
           file "$appimage" | tee /dev/stderr | rg -q 'ARM aarch64'
           rg -q "^version: '?${BUILD_VERSION}'?$" "$manifest"
           rg -q "T3-Code-${BUILD_VERSION}-arm64\\.AppImage" "$manifest"
+          runtime_arch="$(ELECTRON_RUN_AS_NODE=1 "$appimage" -e 'process.stdout.write(process.arch)')"
+          test "$runtime_arch" = arm64
 
           (
             cd release
@@ -195,13 +216,29 @@ jobs:
         run: |
           set -euo pipefail
           target="$(git rev-parse HEAD)"
-          notes="Unofficial Linux ARM64 build of pingdotgg/t3code@${RELEASE_TAG} (${UPSTREAM_SHA})."
-          gh release create "$RELEASE_TAG" \
-            release/T3-Code-*.AppImage \
-            release/nightly-linux-arm64.yml \
-            release/SHA256SUMS \
-            --repo "$FEED_REPOSITORY" \
-            --target "$target" \
-            --title "T3 Code ARM64 Nightly ${RELEASE_TAG#v}" \
-            --notes "$notes" \
-            --prerelease
+          notes="Unofficial Linux ARM64 build of pingdotgg/t3code@${RELEASE_TAG} (${UPSTREAM_SHA}). Uses electron-builder's static AppImage runtime so no host libfuse2 package is required."
+
+          if gh release view "$RELEASE_TAG" --repo "$FEED_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" \
+              release/T3-Code-*.AppImage \
+              release/nightly-linux-arm64.yml \
+              release/SHA256SUMS \
+              --repo "$FEED_REPOSITORY" \
+              --clobber
+            gh release edit "$RELEASE_TAG" \
+              --repo "$FEED_REPOSITORY" \
+              --target "$target" \
+              --title "T3 Code ARM64 Nightly ${RELEASE_TAG#v}" \
+              --notes "$notes" \
+              --prerelease
+          else
+            gh release create "$RELEASE_TAG" \
+              release/T3-Code-*.AppImage \
+              release/nightly-linux-arm64.yml \
+              release/SHA256SUMS \
+              --repo "$FEED_REPOSITORY" \
+              --target "$target" \
+              --title "T3 Code ARM64 Nightly ${RELEASE_TAG#v}" \
+              --notes "$notes" \
+              --prerelease
+          fi
