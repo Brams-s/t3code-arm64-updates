@@ -1,0 +1,199 @@
+name: Mirror T3 Code ARM64 nightly
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "45 */3 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: t3code-arm64-nightly
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve newest upstream nightly
+    runs-on: ubuntu-24.04
+    outputs:
+      build_required: ${{ steps.release.outputs.build_required }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - id: release
+        name: Resolve release
+        env:
+          FEED_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          release_json="$(
+            gh api 'repos/pingdotgg/t3code/releases?per_page=30' \
+              --jq '[.[] | select(.prerelease == true and (.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+-nightly\\.[0-9]{8}\\.[0-9]+$")))][0]'
+          )"
+          tag="$(jq -r '.tag_name // empty' <<<"$release_json")"
+
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-nightly\.[0-9]{8}\.[0-9]+$ ]]; then
+            echo "Could not resolve a valid upstream nightly tag." >&2
+            exit 1
+          fi
+
+          version="${tag#v}"
+          if gh release view "$tag" --repo "$FEED_REPOSITORY" >/dev/null 2>&1; then
+            build_required=false
+            echo "Release $tag is already mirrored."
+          else
+            build_required=true
+            echo "Release $tag needs an ARM64 build."
+          fi
+
+          {
+            echo "build_required=$build_required"
+            echo "tag=$tag"
+            echo "version=$version"
+          } >>"$GITHUB_OUTPUT"
+
+  build:
+    name: Build Linux ARM64 AppImage
+    needs: resolve
+    if: needs.resolve.outputs.build_required == 'true'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      upstream_sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - name: Check out exact upstream tag
+        uses: actions/checkout@v6
+        with:
+          repository: pingdotgg/t3code
+          ref: ${{ needs.resolve.outputs.tag }}
+          path: source
+          fetch-depth: 1
+
+      - id: source
+        name: Record upstream commit
+        working-directory: source
+        run: echo "sha=$(git rev-parse HEAD)" >>"$GITHUB_OUTPUT"
+
+      - name: Set up Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          working-directory: source
+          version-file: package.json
+          node-version-file: package.json
+          cache: true
+          run-install: |
+            args:
+              - --frozen-lockfile
+
+      - name: Enable upstream production public configuration
+        working-directory: source
+        run: cp .env.example .env
+
+      - name: Build AppImage and updater metadata
+        working-directory: source
+        env:
+          BUILD_VERSION: ${{ needs.resolve.outputs.version }}
+          T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          vp run dist:desktop:artifact \
+            --platform linux \
+            --target AppImage \
+            --arch arm64 \
+            --build-version "$BUILD_VERSION"
+
+      - name: Validate build outputs
+        working-directory: source
+        env:
+          BUILD_VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          appimage="release/T3-Code-${BUILD_VERSION}-arm64.AppImage"
+          manifest="release/nightly-linux-arm64.yml"
+
+          test -s "$appimage"
+          test -s "$manifest"
+          file "$appimage" | tee /dev/stderr | rg -q 'ARM aarch64'
+          rg -q "^version: '?${BUILD_VERSION}'?$" "$manifest"
+          rg -q "T3-Code-${BUILD_VERSION}-arm64\\.AppImage" "$manifest"
+
+          sha256sum "$appimage" >release/SHA256SUMS
+
+      - name: Upload validated release files
+        uses: actions/upload-artifact@v7
+        with:
+          name: t3code-arm64-release
+          path: |
+            source/release/T3-Code-${{ needs.resolve.outputs.version }}-arm64.AppImage
+            source/release/nightly-linux-arm64.yml
+            source/release/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish ARM64 update release
+    needs: [resolve, build]
+    if: needs.resolve.outputs.build_required == 'true' && needs.build.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out feed repository
+        uses: actions/checkout@v6
+
+      - name: Download validated release files
+        uses: actions/download-artifact@v8
+        with:
+          name: t3code-arm64-release
+          path: release
+
+      - name: Validate downloaded files
+        env:
+          BUILD_VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          appimage="release/T3-Code-${BUILD_VERSION}-arm64.AppImage"
+          test -s "$appimage"
+          test -s release/nightly-linux-arm64.yml
+          (cd release && sha256sum --check SHA256SUMS)
+          file "$appimage" | tee /dev/stderr | rg -q 'ARM aarch64'
+
+      - name: Record mirrored release
+        env:
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          UPSTREAM_SHA: ${{ needs.build.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          printf '%s %s\n' "$RELEASE_TAG" "$UPSTREAM_SHA" >latest-nightly.txt
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add latest-nightly.txt
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: mirror ${RELEASE_TAG}"
+            git push
+          fi
+
+      - name: Publish GitHub release
+        env:
+          FEED_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          UPSTREAM_SHA: ${{ needs.build.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          target="$(git rev-parse HEAD)"
+          notes="Unofficial Linux ARM64 build of pingdotgg/t3code@${RELEASE_TAG} (${UPSTREAM_SHA})."
+          gh release create "$RELEASE_TAG" \
+            release/T3-Code-*.AppImage \
+            release/nightly-linux-arm64.yml \
+            release/SHA256SUMS \
+            --repo "$FEED_REPOSITORY" \
+            --target "$target" \
+            --title "T3 Code ARM64 Nightly ${RELEASE_TAG#v}" \
+            --notes "$notes" \
+            --prerelease
