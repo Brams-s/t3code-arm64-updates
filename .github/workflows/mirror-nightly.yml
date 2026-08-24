@@ -94,6 +94,11 @@ jobs:
         working-directory: source
         run: cp .env.example .env
 
+      - name: Install AppImage build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes imagemagick
+
       - name: Build AppImage and updater metadata
         working-directory: source
         env:
