@@ -169,7 +169,7 @@ jobs:
           test -s "$appimage"
           test -s release/nightly-linux-arm64.yml
           (cd release && sha256sum --check SHA256SUMS)
-          file "$appimage" | tee /dev/stderr | rg -q 'ARM aarch64'
+          file "$appimage" | tee /dev/stderr | grep -q 'ARM aarch64'
 
       - name: Record mirrored release
         env:
