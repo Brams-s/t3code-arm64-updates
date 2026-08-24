@@ -145,7 +145,14 @@ jobs:
           file "$appimage" | tee /dev/stderr | rg -q 'ARM aarch64'
           rg -q "^version: '?${BUILD_VERSION}'?$" "$manifest"
           rg -q "T3-Code-${BUILD_VERSION}-arm64\\.AppImage" "$manifest"
-          runtime_arch="$(ELECTRON_RUN_AS_NODE=1 "$appimage" -e 'process.stdout.write(process.arch)')"
+
+          # AppRun adds --no-sandbox when user namespaces are unavailable on a runner.
+          # Electron's Node mode does not accept that Chromium flag, so make only this
+          # architecture probe's namespace capability check deterministic.
+          validation_bin="${RUNNER_TEMP}/t3code-appimage-validation-bin"
+          mkdir -p "$validation_bin"
+          ln -s /usr/bin/true "$validation_bin/unshare"
+          runtime_arch="$(PATH="${validation_bin}:${PATH}" ELECTRON_RUN_AS_NODE=1 "$appimage" -e 'process.stdout.write(process.arch)')"
           test "$runtime_arch" = arm64
 
           (
