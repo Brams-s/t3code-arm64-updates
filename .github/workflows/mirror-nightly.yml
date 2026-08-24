@@ -127,7 +127,10 @@ jobs:
           rg -q "^version: '?${BUILD_VERSION}'?$" "$manifest"
           rg -q "T3-Code-${BUILD_VERSION}-arm64\\.AppImage" "$manifest"
 
-          sha256sum "$appimage" >release/SHA256SUMS
+          (
+            cd release
+            sha256sum "T3-Code-${BUILD_VERSION}-arm64.AppImage" >SHA256SUMS
+          )
 
       - name: Upload validated release files
         uses: actions/upload-artifact@v7
