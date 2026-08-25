@@ -9,7 +9,7 @@ on:
         default: false
         type: boolean
       repair_revision:
-        description: Optional ARM64 repair revision for the newest upstream nightly (for example 1)
+        description: Optional updater-compatible repair offset for the newest nightly (normally 1)
         required: false
         default: ""
         type: string
@@ -85,9 +85,15 @@ jobs:
               echo "repair_revision must be a positive integer." >&2
               exit 1
             fi
+            if [[ ! "$base_version" =~ ^(.+-nightly\.[0-9]{8}\.)([0-9]+)$ ]]; then
+              echo "Could not split the upstream nightly sequence number." >&2
+              exit 1
+            fi
 
             repair=true
-            version="${base_version}.arm64.${REPAIR_REVISION}"
+            nightly_prefix="${BASH_REMATCH[1]}"
+            nightly_run="${BASH_REMATCH[2]}"
+            version="${nightly_prefix}$((nightly_run + REPAIR_REVISION))"
             tag="v${version}"
             if gh release view "$tag" --repo "$FEED_REPOSITORY" >/dev/null 2>&1 && \
                [[ "$FORCE_REBUILD" != "true" ]]; then
@@ -124,17 +130,26 @@ jobs:
               mode=skip
               echo "Official Linux ARM64 release $tag is already mirrored."
             fi
-          elif gh release view "$tag" --repo "$FEED_REPOSITORY" >/dev/null 2>&1; then
-            if [[ "$FORCE_REBUILD" == "true" ]]; then
-              mode=build
-              echo "Release $tag will be rebuilt and replaced."
-            else
-              mode=skip
-              echo "Release $tag is already mirrored."
-            fi
           else
-            mode=build
-            echo "Release $tag needs an ARM64 build."
+            mirrored_release_json="$(
+              gh api "repos/${FEED_REPOSITORY}/releases/tags/${tag}" 2>/dev/null || true
+            )"
+            if [[ -n "$mirrored_release_json" ]]; then
+              mirrored_release_body="$(jq -r '.body // empty' <<<"$mirrored_release_json")"
+              if [[ "$FORCE_REBUILD" == "true" ]]; then
+                mode=build
+                echo "Release $tag will be rebuilt and replaced."
+              elif [[ "$mirrored_release_body" == *"t3code-arm64-repair-source:"* ]]; then
+                mode=build
+                echo "Upstream reached reserved repair release $tag; replace it with exact source."
+              else
+                mode=skip
+                echo "Release $tag is already mirrored."
+              fi
+            else
+              mode=build
+              echo "Release $tag needs an ARM64 build."
+            fi
           fi
 
           {
@@ -427,7 +442,7 @@ jobs:
           if [[ "$MIRROR_MODE" == "official" ]]; then
             notes="Official Linux ARM64 files from pingdotgg/t3code@${UPSTREAM_TAG} (${UPSTREAM_SHA}), mirrored as an updater handoff for existing custom-feed installs. The embedded updater points directly to pingdotgg/t3code for subsequent releases."
           elif [[ "$REPAIR" == "true" ]]; then
-            notes="ARM64 packaging repair built from pingdotgg/t3code@${UPSTREAM_TAG} (${UPSTREAM_SHA}). This release aligns the packaged server, desktop, web, and contracts versions so the GUI and electron-updater report the same nightly version."
+            notes="ARM64 packaging repair built from pingdotgg/t3code@${UPSTREAM_TAG} (${UPSTREAM_SHA}). This release aligns the packaged server, desktop, web, and contracts versions so the GUI and electron-updater report the same nightly version. <!-- t3code-arm64-repair-source:${UPSTREAM_TAG} -->"
           else
             notes="Unofficial Linux ARM64 build of pingdotgg/t3code@${UPSTREAM_TAG} (${UPSTREAM_SHA}). Uses electron-builder's static AppImage runtime so no host libfuse2 package is required."
           fi

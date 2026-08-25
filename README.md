@@ -32,6 +32,7 @@ Releases are unofficial architecture builds. T3 Code itself remains copyright T3
 is distributed under its upstream MIT license.
 
 For packaging-only repairs to an already-published nightly, the manual workflow accepts a positive
-`repair_revision`. It publishes `<upstream-version>.arm64.<revision>`, which sorts above that
-nightly but below the next upstream build, allowing existing installations to receive the repair
-through the GUI without delaying their next normal update.
+`repair_revision` offset (normally `1`). It reserves that many nightly sequence slots above the
+upstream build because T3 Code's existing updater only recognizes versions that end in a numeric
+nightly run. When upstream reaches a reserved release, the workflow replaces its assets with an
+exact build of that upstream tag; installed repair builds advance again on the following nightly.
