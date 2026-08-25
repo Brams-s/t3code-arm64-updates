@@ -23,8 +23,11 @@ jobs:
     name: Resolve newest upstream nightly
     runs-on: ubuntu-24.04
     outputs:
-      build_required: ${{ steps.release.outputs.build_required }}
+      mode: ${{ steps.release.outputs.mode }}
+      official_appimage_digest: ${{ steps.release.outputs.official_appimage_digest }}
+      official_manifest_digest: ${{ steps.release.outputs.official_manifest_digest }}
       tag: ${{ steps.release.outputs.tag }}
+      upstream_sha: ${{ steps.release.outputs.upstream_sha }}
       version: ${{ steps.release.outputs.version }}
     steps:
       - id: release
@@ -48,35 +51,81 @@ jobs:
           fi
 
           version="${tag#v}"
-          if gh release view "$tag" --repo "$FEED_REPOSITORY" >/dev/null 2>&1; then
+          upstream_sha="$(jq -r '.target_commitish // empty' <<<"$release_json")"
+          if [[ ! "$upstream_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            upstream_sha="$(gh api "repos/pingdotgg/t3code/commits/${tag}" --jq '.sha')"
+          fi
+
+          official_appimage="T3-Code-${version}-arm64.AppImage"
+          official_manifest="nightly-linux-arm64.yml"
+          official_appimage_digest="$(
+            jq -r --arg name "$official_appimage" \
+              '[.assets[] | select(.name == $name) | .digest][0] // empty' \
+              <<<"$release_json"
+          )"
+          official_manifest_digest="$(
+            jq -r --arg name "$official_manifest" \
+              '[.assets[] | select(.name == $name) | .digest][0] // empty' \
+              <<<"$release_json"
+          )"
+
+          if [[ "$official_appimage_digest" =~ ^sha256:[0-9a-f]{64}$ && \
+                "$official_manifest_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            mirrored_release_json="$(
+              gh api "repos/${FEED_REPOSITORY}/releases/tags/${tag}" 2>/dev/null || true
+            )"
+            if [[ -z "$mirrored_release_json" ]]; then
+              mirrored_release_json='{}'
+            fi
+            mirrored_appimage_digest="$(
+              jq -r --arg name "$official_appimage" \
+                '[.assets[]? | select(.name == $name) | .digest][0] // empty' \
+                <<<"$mirrored_release_json"
+            )"
+            mirrored_manifest_digest="$(
+              jq -r --arg name "$official_manifest" \
+                '[.assets[]? | select(.name == $name) | .digest][0] // empty' \
+                <<<"$mirrored_release_json"
+            )"
+            if [[ "$FORCE_REBUILD" == "true" || \
+                  "$mirrored_appimage_digest" != "$official_appimage_digest" || \
+                  "$mirrored_manifest_digest" != "$official_manifest_digest" ]]; then
+              mode=official
+              echo "Release $tag has an official Linux ARM64 build; prepare updater handoff."
+            else
+              mode=skip
+              echo "Official Linux ARM64 release $tag is already mirrored."
+            fi
+          elif gh release view "$tag" --repo "$FEED_REPOSITORY" >/dev/null 2>&1; then
             if [[ "$FORCE_REBUILD" == "true" ]]; then
-              build_required=true
+              mode=build
               echo "Release $tag will be rebuilt and replaced."
             else
-              build_required=false
+              mode=skip
               echo "Release $tag is already mirrored."
             fi
           else
-            build_required=true
+            mode=build
             echo "Release $tag needs an ARM64 build."
           fi
 
           {
-            echo "build_required=$build_required"
+            echo "mode=$mode"
+            echo "official_appimage_digest=$official_appimage_digest"
+            echo "official_manifest_digest=$official_manifest_digest"
             echo "tag=$tag"
+            echo "upstream_sha=$upstream_sha"
             echo "version=$version"
           } >>"$GITHUB_OUTPUT"
 
   build:
     name: Build Linux ARM64 AppImage
     needs: resolve
-    if: needs.resolve.outputs.build_required == 'true'
+    if: needs.resolve.outputs.mode == 'build'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     permissions:
       contents: read
-    outputs:
-      upstream_sha: ${{ steps.source.outputs.sha }}
     steps:
       - name: Check out feed repository
         uses: actions/checkout@v6
@@ -89,10 +138,11 @@ jobs:
           path: source
           fetch-depth: 1
 
-      - id: source
-        name: Record upstream commit
+      - name: Verify upstream commit
         working-directory: source
-        run: echo "sha=$(git rev-parse HEAD)" >>"$GITHUB_OUTPUT"
+        env:
+          UPSTREAM_SHA: ${{ needs.resolve.outputs.upstream_sha }}
+        run: test "$(git rev-parse HEAD)" = "$UPSTREAM_SHA"
 
       - name: Select the rootless static AppImage runtime
         working-directory: source
@@ -171,10 +221,82 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  handoff:
+    name: Prepare official Linux ARM64 handoff
+    needs: resolve
+    if: needs.resolve.outputs.mode == 'official'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Download exact official release files
+        env:
+          BUILD_VERSION: ${{ needs.resolve.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir release
+          gh release download "$RELEASE_TAG" \
+            --repo pingdotgg/t3code \
+            --dir release \
+            --pattern "T3-Code-${BUILD_VERSION}-arm64.AppImage" \
+            --pattern nightly-linux-arm64.yml
+
+      - name: Validate official updater handoff
+        env:
+          APPIMAGE_DIGEST: ${{ needs.resolve.outputs.official_appimage_digest }}
+          BUILD_VERSION: ${{ needs.resolve.outputs.version }}
+          MANIFEST_DIGEST: ${{ needs.resolve.outputs.official_manifest_digest }}
+        run: |
+          set -euo pipefail
+          appimage="release/T3-Code-${BUILD_VERSION}-arm64.AppImage"
+          manifest="release/nightly-linux-arm64.yml"
+          appimage_sha="${APPIMAGE_DIGEST#sha256:}"
+          manifest_sha="${MANIFEST_DIGEST#sha256:}"
+
+          test -s "$appimage"
+          test -s "$manifest"
+          printf '%s  %s\n' "$appimage_sha" "$appimage" | sha256sum --check
+          printf '%s  %s\n' "$manifest_sha" "$manifest" | sha256sum --check
+          file "$appimage" | tee /dev/stderr | grep -q 'ARM aarch64'
+          grep -Eq "^version: '?${BUILD_VERSION}'?$" "$manifest"
+          grep -q "T3-Code-${BUILD_VERSION}-arm64\.AppImage" "$manifest"
+
+          chmod 0755 "$appimage"
+          "$appimage" --appimage-extract >/dev/null
+          update_config="squashfs-root/resources/app-update.yml"
+          test -s "$update_config"
+          grep -q '^owner: pingdotgg$' "$update_config"
+          grep -q '^repo: t3code$' "$update_config"
+          grep -q '^provider: github$' "$update_config"
+
+          (
+            cd release
+            sha256sum "T3-Code-${BUILD_VERSION}-arm64.AppImage" >SHA256SUMS
+          )
+
+      - name: Upload validated release files
+        uses: actions/upload-artifact@v7
+        with:
+          name: t3code-arm64-release
+          path: |
+            release/T3-Code-${{ needs.resolve.outputs.version }}-arm64.AppImage
+            release/nightly-linux-arm64.yml
+            release/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 1
+
   publish:
     name: Publish ARM64 update release
-    needs: [resolve, build]
-    if: needs.resolve.outputs.build_required == 'true' && needs.build.result == 'success'
+    needs: [resolve, build, handoff]
+    if: >-
+      ${{
+        always() &&
+        needs.resolve.result == 'success' &&
+        (needs.build.result == 'success' || needs.handoff.result == 'success')
+      }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -201,11 +323,12 @@ jobs:
 
       - name: Record mirrored release
         env:
+          MIRROR_MODE: ${{ needs.resolve.outputs.mode }}
           RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
-          UPSTREAM_SHA: ${{ needs.build.outputs.upstream_sha }}
+          UPSTREAM_SHA: ${{ needs.resolve.outputs.upstream_sha }}
         run: |
           set -euo pipefail
-          printf '%s %s\n' "$RELEASE_TAG" "$UPSTREAM_SHA" >latest-nightly.txt
+          printf '%s %s %s\n' "$RELEASE_TAG" "$UPSTREAM_SHA" "$MIRROR_MODE" >latest-nightly.txt
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add latest-nightly.txt
@@ -218,12 +341,17 @@ jobs:
         env:
           FEED_REPOSITORY: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
+          MIRROR_MODE: ${{ needs.resolve.outputs.mode }}
           RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
-          UPSTREAM_SHA: ${{ needs.build.outputs.upstream_sha }}
+          UPSTREAM_SHA: ${{ needs.resolve.outputs.upstream_sha }}
         run: |
           set -euo pipefail
           target="$(git rev-parse HEAD)"
-          notes="Unofficial Linux ARM64 build of pingdotgg/t3code@${RELEASE_TAG} (${UPSTREAM_SHA}). Uses electron-builder's static AppImage runtime so no host libfuse2 package is required."
+          if [[ "$MIRROR_MODE" == "official" ]]; then
+            notes="Official Linux ARM64 files from pingdotgg/t3code@${RELEASE_TAG} (${UPSTREAM_SHA}), mirrored as an updater handoff for existing custom-feed installs. The embedded updater points directly to pingdotgg/t3code for subsequent releases."
+          else
+            notes="Unofficial Linux ARM64 build of pingdotgg/t3code@${RELEASE_TAG} (${UPSTREAM_SHA}). Uses electron-builder's static AppImage runtime so no host libfuse2 package is required."
+          fi
 
           if gh release view "$RELEASE_TAG" --repo "$FEED_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" \
