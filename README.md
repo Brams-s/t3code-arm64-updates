@@ -19,6 +19,8 @@ reinstall.
 - If the release has no official Linux ARM64 files, it checks out the exact nightly tag and builds
   on a native GitHub-hosted ARM64 runner.
 - It applies the tracked static-runtime patch before packaging; application source is unchanged.
+- It runs upstream's release-version alignment before building and verifies that the packaged web
+  client contains the same version as the AppImage updater metadata.
 - The build embeds this repository as its update provider.
 - The workflow publishes the ARM64 AppImage, `nightly-linux-arm64.yml`, and SHA-256 checksum.
 - If an official ARM64 AppImage and manifest are present, it validates their GitHub digests,
@@ -28,3 +30,8 @@ reinstall.
 
 Releases are unofficial architecture builds. T3 Code itself remains copyright T3 Tools Inc. and
 is distributed under its upstream MIT license.
+
+For packaging-only repairs to an already-published nightly, the manual workflow accepts a positive
+`repair_revision`. It publishes `<upstream-version>.arm64.<revision>`, which sorts above that
+nightly but below the next upstream build, allowing existing installations to receive the repair
+through the GUI without delaying their next normal update.

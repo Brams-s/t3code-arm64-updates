@@ -8,6 +8,11 @@ on:
         required: false
         default: false
         type: boolean
+      repair_revision:
+        description: Optional ARM64 repair revision for the newest upstream nightly (for example 1)
+        required: false
+        default: ""
+        type: string
   schedule:
     - cron: "45 */3 * * *"
 
@@ -26,8 +31,10 @@ jobs:
       mode: ${{ steps.release.outputs.mode }}
       official_appimage_digest: ${{ steps.release.outputs.official_appimage_digest }}
       official_manifest_digest: ${{ steps.release.outputs.official_manifest_digest }}
+      repair: ${{ steps.release.outputs.repair }}
       tag: ${{ steps.release.outputs.tag }}
       upstream_sha: ${{ steps.release.outputs.upstream_sha }}
+      upstream_tag: ${{ steps.release.outputs.upstream_tag }}
       version: ${{ steps.release.outputs.version }}
     steps:
       - id: release
@@ -36,6 +43,7 @@ jobs:
           FEED_REPOSITORY: ${{ github.repository }}
           FORCE_REBUILD: ${{ inputs.force_rebuild }}
           GH_TOKEN: ${{ github.token }}
+          REPAIR_REVISION: ${{ inputs.repair_revision }}
         run: |
           set -euo pipefail
 
@@ -43,20 +51,23 @@ jobs:
             gh api 'repos/pingdotgg/t3code/releases?per_page=30' \
               --jq '[.[] | select(.prerelease == true and (.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+-nightly\\.[0-9]{8}\\.[0-9]+$")))][0]'
           )"
-          tag="$(jq -r '.tag_name // empty' <<<"$release_json")"
+          upstream_tag="$(jq -r '.tag_name // empty' <<<"$release_json")"
 
-          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-nightly\.[0-9]{8}\.[0-9]+$ ]]; then
+          if [[ ! "$upstream_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-nightly\.[0-9]{8}\.[0-9]+$ ]]; then
             echo "Could not resolve a valid upstream nightly tag." >&2
             exit 1
           fi
 
-          version="${tag#v}"
+          base_version="${upstream_tag#v}"
+          version="$base_version"
+          tag="$upstream_tag"
+          repair=false
           upstream_sha="$(jq -r '.target_commitish // empty' <<<"$release_json")"
           if [[ ! "$upstream_sha" =~ ^[0-9a-f]{40}$ ]]; then
-            upstream_sha="$(gh api "repos/pingdotgg/t3code/commits/${tag}" --jq '.sha')"
+            upstream_sha="$(gh api "repos/pingdotgg/t3code/commits/${upstream_tag}" --jq '.sha')"
           fi
 
-          official_appimage="T3-Code-${version}-arm64.AppImage"
+          official_appimage="T3-Code-${base_version}-arm64.AppImage"
           official_manifest="nightly-linux-arm64.yml"
           official_appimage_digest="$(
             jq -r --arg name "$official_appimage" \
@@ -69,7 +80,24 @@ jobs:
               <<<"$release_json"
           )"
 
-          if [[ "$official_appimage_digest" =~ ^sha256:[0-9a-f]{64}$ && \
+          if [[ -n "$REPAIR_REVISION" ]]; then
+            if [[ ! "$REPAIR_REVISION" =~ ^[1-9][0-9]*$ ]]; then
+              echo "repair_revision must be a positive integer." >&2
+              exit 1
+            fi
+
+            repair=true
+            version="${base_version}.arm64.${REPAIR_REVISION}"
+            tag="v${version}"
+            if gh release view "$tag" --repo "$FEED_REPOSITORY" >/dev/null 2>&1 && \
+               [[ "$FORCE_REBUILD" != "true" ]]; then
+              mode=skip
+              echo "ARM64 repair release $tag is already mirrored."
+            else
+              mode=build
+              echo "Build ARM64 repair release $tag from upstream $upstream_tag."
+            fi
+          elif [[ "$official_appimage_digest" =~ ^sha256:[0-9a-f]{64}$ && \
                 "$official_manifest_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             mirrored_release_json="$(
               gh api "repos/${FEED_REPOSITORY}/releases/tags/${tag}" 2>/dev/null || true
@@ -113,8 +141,10 @@ jobs:
             echo "mode=$mode"
             echo "official_appimage_digest=$official_appimage_digest"
             echo "official_manifest_digest=$official_manifest_digest"
+            echo "repair=$repair"
             echo "tag=$tag"
             echo "upstream_sha=$upstream_sha"
+            echo "upstream_tag=$upstream_tag"
             echo "version=$version"
           } >>"$GITHUB_OUTPUT"
 
@@ -134,7 +164,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: pingdotgg/t3code
-          ref: ${{ needs.resolve.outputs.tag }}
+          ref: ${{ needs.resolve.outputs.upstream_tag }}
           path: source
           fetch-depth: 1
 
@@ -158,6 +188,21 @@ jobs:
           run-install: |
             args:
               - --frozen-lockfile
+
+      - name: Align package versions to release version
+        working-directory: source
+        env:
+          BUILD_VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          node scripts/update-release-package-versions.ts "$BUILD_VERSION"
+          for package_file in \
+            apps/server/package.json \
+            apps/desktop/package.json \
+            apps/web/package.json \
+            packages/contracts/package.json; do
+            test "$(jq -r '.version' "$package_file")" = "$BUILD_VERSION"
+          done
 
       - name: Enable upstream production public configuration
         working-directory: source
@@ -204,6 +249,36 @@ jobs:
           ln -s /usr/bin/true "$validation_bin/unshare"
           runtime_arch="$(PATH="${validation_bin}:${PATH}" ELECTRON_RUN_AS_NODE=1 "$appimage" -e 'process.stdout.write(process.arch)')"
           test "$runtime_arch" = arm64
+
+          "$appimage" --appimage-extract >/dev/null
+          ELECTRON_RUN_AS_NODE=1 squashfs-root/t3code - "$BUILD_VERSION" <<'NODE'
+          const fs = require("node:fs");
+          const path = require("node:path");
+
+          const expectedVersion = process.argv[2];
+          const clientRoot = path.resolve(
+            "squashfs-root/resources/app.asar/apps/server/dist/client",
+          );
+          const pending = [clientRoot];
+          let found = false;
+
+          while (pending.length > 0 && !found) {
+            const current = pending.pop();
+            for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+              const entryPath = path.join(current, entry.name);
+              if (entry.isDirectory()) {
+                pending.push(entryPath);
+              } else if (/\.(?:html|js)$/.test(entry.name)) {
+                found = fs.readFileSync(entryPath, "utf8").includes(expectedVersion);
+                if (found) break;
+              }
+            }
+          }
+
+          if (!found) {
+            throw new Error(`Packaged client does not contain version ${expectedVersion}.`);
+          }
+          NODE
 
           (
             cd release
@@ -342,15 +417,19 @@ jobs:
           FEED_REPOSITORY: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
           MIRROR_MODE: ${{ needs.resolve.outputs.mode }}
+          REPAIR: ${{ needs.resolve.outputs.repair }}
           RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
           UPSTREAM_SHA: ${{ needs.resolve.outputs.upstream_sha }}
+          UPSTREAM_TAG: ${{ needs.resolve.outputs.upstream_tag }}
         run: |
           set -euo pipefail
           target="$(git rev-parse HEAD)"
           if [[ "$MIRROR_MODE" == "official" ]]; then
-            notes="Official Linux ARM64 files from pingdotgg/t3code@${RELEASE_TAG} (${UPSTREAM_SHA}), mirrored as an updater handoff for existing custom-feed installs. The embedded updater points directly to pingdotgg/t3code for subsequent releases."
+            notes="Official Linux ARM64 files from pingdotgg/t3code@${UPSTREAM_TAG} (${UPSTREAM_SHA}), mirrored as an updater handoff for existing custom-feed installs. The embedded updater points directly to pingdotgg/t3code for subsequent releases."
+          elif [[ "$REPAIR" == "true" ]]; then
+            notes="ARM64 packaging repair built from pingdotgg/t3code@${UPSTREAM_TAG} (${UPSTREAM_SHA}). This release aligns the packaged server, desktop, web, and contracts versions so the GUI and electron-updater report the same nightly version."
           else
-            notes="Unofficial Linux ARM64 build of pingdotgg/t3code@${RELEASE_TAG} (${UPSTREAM_SHA}). Uses electron-builder's static AppImage runtime so no host libfuse2 package is required."
+            notes="Unofficial Linux ARM64 build of pingdotgg/t3code@${UPSTREAM_TAG} (${UPSTREAM_SHA}). Uses electron-builder's static AppImage runtime so no host libfuse2 package is required."
           fi
 
           if gh release view "$RELEASE_TAG" --repo "$FEED_REPOSITORY" >/dev/null 2>&1; then
