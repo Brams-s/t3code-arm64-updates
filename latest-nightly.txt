@@ -1,1 +1,1 @@
-v0.0.46-nightly.20261004.2657 efecd3cf8bcec3d1891b5f5a27dc2f6d797c6448 official
+v0.0.46-nightly.20261005.2667 37de6cbde65c7cf9ba90a2557c232e63b7e16988 official
